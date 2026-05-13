@@ -1,0 +1,25 @@
+# Environment variables
+.env
+.env.*
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+env/
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# Generated outputs
+generated/
+
+# Logs
+*.log
