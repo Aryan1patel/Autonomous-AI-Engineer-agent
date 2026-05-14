@@ -6,6 +6,8 @@ Endpoints:
   GET  /stream-task/{task_id} → SSE stream of live pipeline events
   POST /submit-task           → enqueue a task, returns a task_id immediately
   GET  /task/{task_id}        → poll status/result of a submitted task
+  POST /generate-payload      → generate a test payload for the assembled app
+  POST /run-api-test          → boot the assembled app and POST a test payload
   GET  /health                → liveness probe
   GET  /files/{filename}      → download a file from the generated/ directory
   GET  /files                 → list all files in the generated/ directory
@@ -18,7 +20,10 @@ import asyncio
 import json
 import os
 import queue
+import subprocess
+import sys
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import AsyncGenerator, Optional
@@ -113,6 +118,27 @@ class HealthResponse(BaseModel):
 class FileListResponse(BaseModel):
     files: list[str]
     count: int
+
+
+class GeneratePayloadRequest(BaseModel):
+    task: str
+    endpoint: str = "/predict"
+    openapi_schema: dict = {}
+
+
+class ApiTestRequest(BaseModel):
+    task: str
+    app_path: str          # absolute path to the assembled app.py
+    payload: Optional[dict] = None   # if None, auto-generate
+
+
+class ApiTestResponse(BaseModel):
+    success: bool
+    endpoint: Optional[str] = None
+    payload: Optional[dict] = None
+    status_code: Optional[int] = None
+    response: Optional[dict] = None
+    error: Optional[str] = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -319,6 +345,122 @@ async def download_file(filename: str) -> FileResponse:
     if not target.exists():
         raise HTTPException(status_code=404, detail=f"File '{safe_name}' not found")
     return FileResponse(path=str(target), filename=safe_name, media_type="text/plain")
+
+
+@app.post("/generate-payload", tags=["Testing"])
+async def generate_payload_endpoint(request: GeneratePayloadRequest) -> dict:
+    """
+    Generate a realistic test payload for the assembled app's POST endpoint.
+    Uses the task description + OpenAPI schema to pick field values.
+    """
+    from agents import generate_test_payload
+    payload = generate_test_payload(request.task, request.endpoint, request.openapi_schema)
+    return {"payload": payload}
+
+
+@app.post("/run-api-test", response_model=ApiTestResponse, tags=["Testing"])
+async def run_api_test_endpoint(request: ApiTestRequest) -> ApiTestResponse:
+    """
+    Boot the assembled FastAPI app, discover its first POST endpoint,
+    POST the provided (or auto-generated) payload, and return the result.
+    Runs in a thread so it doesn't block the event loop.
+    """
+    from agents import generate_test_payload
+    from config import TEST_PORT
+
+    app_path = Path(request.app_path)
+    if not app_path.exists():
+        raise HTTPException(status_code=404, detail=f"App file not found: {request.app_path}")
+
+    def _free_port(port: int):
+        try:
+            result = subprocess.run(["lsof", "-ti", f":{port}"], capture_output=True, text=True)
+            pids = result.stdout.strip().split()
+            for pid in pids:
+                subprocess.run(["kill", "-9", pid], capture_output=True)
+            if pids:
+                time.sleep(0.5)
+        except Exception:
+            pass
+
+    def _run_test() -> dict:
+        import requests as req
+        _free_port(TEST_PORT)
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "uvicorn", "app:app",
+                 f"--port={TEST_PORT}", "--log-level=error"],
+                cwd=str(app_path.parent),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+            # Poll until server is ready (max 30s)
+            ready = False
+            crash_err = ""
+            for _ in range(30):
+                time.sleep(1)
+                if proc.poll() is not None:
+                    crash_err = proc.stderr.read().decode(errors="replace")[:600]
+                    break
+                try:
+                    r = req.get(f"http://127.0.0.1:{TEST_PORT}/health", timeout=2)
+                    if r.status_code < 500:
+                        ready = True
+                        break
+                except req.exceptions.ConnectionError:
+                    pass
+                except Exception:
+                    pass
+
+            if not ready:
+                err = crash_err if crash_err else "Timeout — server did not start in 30s"
+                return {"success": False, "error": f"Server failed to start: {err}"}
+
+            base = f"http://127.0.0.1:{TEST_PORT}"
+            endpoint = "/predict"
+            openapi: dict = {}
+            try:
+                openapi = req.get(f"{base}/openapi.json", timeout=5).json()
+                for path, methods in openapi.get("paths", {}).items():
+                    if "post" in methods and path not in ("/", "/health"):
+                        endpoint = path
+                        break
+            except Exception:
+                pass
+
+            payload = request.payload if request.payload is not None else generate_test_payload(request.task, endpoint, openapi)
+
+            response = req.post(f"{base}{endpoint}", json=payload, timeout=10)
+            if response.status_code != 200:
+                return {
+                    "success": False,
+                    "endpoint": endpoint,
+                    "payload": payload,
+                    "error": f"HTTP {response.status_code}: {response.text[:300]}",
+                }
+            return {
+                "success": True,
+                "endpoint": endpoint,
+                "payload": payload,
+                "status_code": response.status_code,
+                "response": response.json(),
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+        finally:
+            if proc and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except Exception:
+                    proc.kill()
+
+    # Run the blocking test in a thread
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, _run_test)
+    return ApiTestResponse(**result)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -3,6 +3,16 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import Link from "next/link";
 import clsx from "clsx";
+
+// ── Test panel types ─────────────────────────────────────────────────────────
+interface TestResult {
+  success: boolean;
+  endpoint?: string;
+  payload?: Record<string, unknown>;
+  status_code?: number;
+  response?: Record<string, unknown>;
+  error?: string;
+}
 import {
   Zap, CheckCircle2, XCircle, Clock, Download,
   Copy, Check, ChevronDown, ChevronUp, RotateCcw, Activity
@@ -189,6 +199,156 @@ function LogViewer({ logs }: { logs: string[] }) {
   );
 }
 
+// ── TestPanel component ──────────────────────────────────────────────────────
+function TestPanel({ result, apiBase }: { result: PipelineResult; apiBase: string }) {
+  const STDLIB = new Set(["os","sys","re","json","math","time","datetime","pathlib",
+    "typing","collections","itertools","functools","subprocess","hashlib","uuid",
+    "random","string","io","abc","copy","threading","asyncio","http","urllib"]);
+
+  // Detect third-party libs from generated files
+  const appFile = result.generated_files.find(f => f.endsWith("app.py"));
+  const [thirdParty, setThirdParty] = useState<string[]>([]);
+  const [payloadStr, setPayloadStr] = useState("{}");
+  const [jsonError, setJsonError] = useState("");
+  const [testResult, setTestResult] = useState<TestResult | null>(null);
+  const [testing, setTesting] = useState(false);
+  const initialized = useRef(false);
+
+  useEffect(() => {
+    if (initialized.current) return;
+    initialized.current = true;
+    if (!appFile) return;
+    const name = appFile.split("/").pop()!;
+    fetch(`${apiBase}/files/${name}`)
+      .then(r => r.text())
+      .then(src => {
+        const libs: string[] = [];
+        src.split("\n").forEach(line => {
+          const m = line.match(/^(?:import|from)\s+([\w]+)/);
+          if (m && !STDLIB.has(m[1]) && !libs.includes(m[1])) libs.push(m[1]);
+        });
+        setThirdParty(libs);
+      }).catch(() => {});
+    // seed payload
+    fetch(`${apiBase}/generate-payload`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: result.task, endpoint: "/predict", openapi_schema: {} }),
+    }).then(r => r.json()).then(d => {
+      setPayloadStr(JSON.stringify(d.payload ?? {}, null, 2));
+    }).catch(() => {});
+  }, [appFile, apiBase, result.task]);
+
+  const validate = (s: string) => {
+    try { JSON.parse(s); setJsonError(""); return true; }
+    catch(e: unknown) { setJsonError(String(e)); return false; }
+  };
+
+  const handlePayloadChange = (v: string) => {
+    setPayloadStr(v); validate(v);
+  };
+
+  const handleReset = async () => {
+    setTestResult(null);
+    try {
+      const r = await fetch(`${apiBase}/generate-payload`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task: result.task, endpoint: "/predict", openapi_schema: {} }),
+      });
+      const d = await r.json();
+      setPayloadStr(JSON.stringify(d.payload ?? {}, null, 2));
+      setJsonError("");
+    } catch {}
+  };
+
+  const handleRunTest = async () => {
+    if (!appFile || !validate(payloadStr)) return;
+    setTesting(true);
+    setTestResult(null);
+    try {
+      const r = await fetch(`${apiBase}/run-api-test`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task: result.task, app_path: appFile, payload: JSON.parse(payloadStr) }),
+      });
+      const data = await r.json();
+      setTestResult(data);
+    } catch(e) {
+      setTestResult({ success: false, error: String(e) });
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  if (!appFile) return null;
+
+  return (
+    <div className={s.testPanel}>
+      <div className={s.cardTitle}>🧪 &nbsp;Test the Generated API</div>
+
+      {thirdParty.length > 0 && (
+        <div className={s.depWarn}>
+          <div className={s.depWarnTitle}>⚠️ &nbsp;Before testing — install dependencies</div>
+          <div className={s.depWarnLibs}>Your app uses: <span>{thirdParty.join(", ")}</span></div>
+          <div className={s.depWarnCmd}>pip install {thirdParty.join(" ")}</div>
+        </div>
+      )}
+
+      <div className={s.payloadLabel}>✏️ &nbsp;Edit test payload</div>
+      <textarea
+        className={s.payloadEditor}
+        value={payloadStr}
+        onChange={e => handlePayloadChange(e.target.value)}
+        rows={5}
+        spellCheck={false}
+      />
+      {jsonError && <div className={s.jsonError}>⛔ {jsonError}</div>}
+
+      <div className={s.testBtns}>
+        <button
+          className={s.btnRunTest}
+          onClick={handleRunTest}
+          disabled={testing || !!jsonError}
+          id="run-test-btn"
+        >
+          {testing
+            ? <><div className={clsx(s.spinner, "anim-spin")} /> Starting server…</>
+            : <>🧪 Run Test</>}
+        </button>
+        <button className={s.btnReset} onClick={handleReset}>↺ Reset</button>
+      </div>
+
+      {testResult && (
+        <div className={clsx(s.testResultBox, testResult.success ? s.testResultSuccess : s.testResultFailed)}>
+          <div className={clsx(s.testResultHeader, testResult.success ? s.testResultHeaderSuccess : s.testResultHeaderFailed)}>
+            {testResult.success ? "🧪 API Test — Passed ✓" : "🧪 API Test — Failed ✗"}
+          </div>
+          {testResult.success ? (
+            <>
+              <div className={s.testEndpoint}>POST &nbsp;<span>{testResult.endpoint}</span></div>
+              <div className={s.testBlock}>
+                <div className={s.testBlockLabel}>Request</div>
+                <div className={clsx(s.testBlockCode, s.testBlockCodeRequest)}>
+                  {JSON.stringify(testResult.payload, null, 2)}
+                </div>
+              </div>
+              <div className={s.testBlock}>
+                <div className={s.testBlockLabel}>Response &nbsp;HTTP {testResult.status_code}</div>
+                <div className={clsx(s.testBlockCode, s.testBlockCodeResponse)}>
+                  {JSON.stringify(testResult.response, null, 2)}
+                </div>
+              </div>
+            </>
+          ) : (
+            <div className={s.testErrorMsg}>{testResult.error ?? "Unknown error"}</div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Main Page ─────────────────────────────────────────────────────────────────
 export default function Home() {
   const [task, setTask]           = useState("");
@@ -197,7 +357,8 @@ export default function Home() {
   const [logs, setLogs]           = useState<string[]>([]);
   const [plan, setPlan]           = useState<string[]>([]);
   const [result, setResult]       = useState<PipelineResult | null>(null);
-  const [errorsOpen, setErrorsOpen] = useState(false);
+  const [errorsOpen, setErrorsOpen]   = useState(false);
+  const [outputsOpen, setOutputsOpen] = useState(false);
   const textareaRef               = useRef<HTMLTextAreaElement>(null);
   const eventSourceRef            = useRef<EventSource | null>(null);
 
@@ -502,7 +663,38 @@ export default function Home() {
                   </div>
                 )}
 
-                {/* Errors */}
+                {/* Step execution outputs — matches original Streamlit feature */}
+                {result.outputs.length > 0 && (
+                  <div className={s.expander} style={{ borderColor: "rgba(99,102,241,0.2)", marginBottom: "1rem" }}>
+                    <button
+                      className={s.expanderHeader}
+                      style={{ background: "rgba(99,102,241,0.07)", color: "#818cf8" }}
+                      onClick={() => setOutputsOpen(o => !o)}
+                    >
+                      <span>🖥️ &nbsp;Step execution outputs ({result.outputs.length})</span>
+                      {outputsOpen ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+                    </button>
+                    {outputsOpen && (
+                      <div className={s.expanderBody}>
+                        {result.outputs.map((out, i) => (
+                          <div key={i} style={{
+                            fontFamily: "var(--font-mono)",
+                            fontSize: "0.74rem",
+                            color: "#94a3b8",
+                            background: "rgba(0,0,0,0.3)",
+                            borderRadius: "6px",
+                            padding: "0.6rem 0.8rem",
+                            marginBottom: "0.4rem",
+                          }}>
+                            <span style={{ color: "#475569" }}>step {i + 1} › </span>{out}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Step errors */}
                 {result.errors.length > 0 && (
                   <div className={s.expander}>
                     <button className={s.expanderHeader} onClick={() => setErrorsOpen(o => !o)}>
@@ -517,6 +709,11 @@ export default function Home() {
                       </div>
                     )}
                   </div>
+                )}
+
+                {/* Test Panel — only shown when pipeline succeeded and app.py exists */}
+                {result.status === "success" && result.generated_files.some(f => f.endsWith("app.py")) && (
+                  <TestPanel result={result} apiBase={API_BASE} />
                 )}
               </>
             )}
