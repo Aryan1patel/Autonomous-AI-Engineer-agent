@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useEffect, useCallback } from "react";
+import React, { useState, useRef, useEffect, useCallback } from "react";
 import Link from "next/link";
 import clsx from "clsx";
 
@@ -126,6 +126,37 @@ function CopyButton({ text }: { text: string }) {
 function CodeViewer({ files }: { files: string[] }) {
   const [active, setActive] = useState(0);
   const [contents, setContents] = useState<Record<string, string>>({});
+  const [SyntaxHighlighter, setSyntaxHighlighter] = useState<React.ComponentType<{
+    language: string; style: Record<string, React.CSSProperties>;
+    showLineNumbers?: boolean; wrapLines?: boolean;
+    customStyle?: React.CSSProperties; lineNumberStyle?: React.CSSProperties;
+    children: string;
+  }> | null>(null);
+  const [hlStyle, setHlStyle] = useState<Record<string, React.CSSProperties> | null>(null);
+
+  // Dynamic import to avoid SSR issues
+  useEffect(() => {
+    import("react-syntax-highlighter").then(mod => {
+      setSyntaxHighlighter(() => mod.Prism as typeof SyntaxHighlighter);
+    });
+    import("react-syntax-highlighter/dist/esm/styles/prism").then(styles => {
+      // vscDarkPlus-like custom theme matching our palette
+      setHlStyle(styles.vscDarkPlus as unknown as Record<string, React.CSSProperties>);
+    });
+  }, []);
+
+  // Sort: app.py first, then alphabetically
+  const sorted = [...files].sort((a, b) => {
+    const aName = a.split("/").pop()!;
+    const bName = b.split("/").pop()!;
+    if (aName === "app.py") return -1;
+    if (bName === "app.py") return 1;
+    return aName.localeCompare(bName);
+  });
+
+  const names = sorted.map(f => f.split("/").pop()!);
+  const activeName = names[active] ?? "";
+  const activeContent = contents[activeName] ?? "";
 
   // Fetch file content from backend
   const load = useCallback(async (filename: string) => {
@@ -140,16 +171,19 @@ function CodeViewer({ files }: { files: string[] }) {
   }, [contents]);
 
   useEffect(() => {
-    if (files.length > 0) {
-      const name = files[0].split("/").pop()!;
-      load(name);
-    }
-  }, [files, load]);
+    if (sorted.length > 0) load(names[0]);
+  }, [sorted.length]);  // eslint-disable-line
 
-  const names = files.map(f => f.split("/").pop()!);
+  const getLang = (name: string) =>
+    name.endsWith(".py") ? "python" :
+    name.endsWith(".json") ? "json" :
+    name.endsWith(".txt") ? "text" : "text";
+
+  const lineCount = activeContent.split("\n").length;
 
   return (
     <div>
+      {/* Tab bar */}
       <div className={s.tabBar}>
         {names.map((name, i) => (
           <button
@@ -158,23 +192,75 @@ function CodeViewer({ files }: { files: string[] }) {
             data-active={active === i ? "true" : "false"}
             onClick={() => { setActive(i); load(name); }}
           >
-            {name}
+            {name === "app.py" ? "⭐ " : ""}{name}
           </button>
         ))}
       </div>
-      <div className={s.codeWrap}>
-        <CopyButton text={contents[names[active]] ?? ""} />
-        <pre className={s.codeBlock}>
-          {contents[names[active]] ?? "Loading…"}
-        </pre>
+
+      {/* Code block */}
+      <div className={s.codeWrap} style={{ borderTop: "none", borderRadius: "0 0 12px 12px" }}>
+        {/* Header bar */}
+        <div style={{
+          display: "flex", alignItems: "center", justifyContent: "space-between",
+          padding: "0.55rem 1rem",
+          background: "rgba(255,255,255,0.03)",
+          borderBottom: "1px solid var(--border)",
+        }}>
+          <span style={{
+            fontFamily: "var(--font-mono)", fontSize: "0.62rem",
+            color: "var(--text-dim)", letterSpacing: "0.1em",
+          }}>
+            {getLang(activeName).toUpperCase()} · {lineCount} lines
+          </span>
+          <CopyButton text={activeContent} />
+        </div>
+
+        {/* Syntax highlighted code */}
+        <div style={{ overflow: "auto", maxHeight: "480px" }}>
+          {activeContent === "" ? (
+            <div style={{
+              padding: "1.5rem", fontFamily: "var(--font-mono)",
+              fontSize: "0.78rem", color: "var(--text-muted)",
+            }}>Loading…</div>
+          ) : SyntaxHighlighter && hlStyle ? (
+            <SyntaxHighlighter
+              language={getLang(activeName)}
+              style={hlStyle}
+              showLineNumbers
+              wrapLines
+              customStyle={{
+                margin: 0,
+                background: "#060912",
+                fontSize: "0.78rem",
+                lineHeight: "1.75",
+                padding: "1rem 0",
+                borderRadius: 0,
+              }}
+              lineNumberStyle={{
+                color: "#334155",
+                minWidth: "2.8em",
+                paddingRight: "1em",
+                textAlign: "right",
+                userSelect: "none",
+                fontSize: "0.72rem",
+              }}
+            >
+              {activeContent}
+            </SyntaxHighlighter>
+          ) : (
+            <pre className={s.codeBlock}>{activeContent}</pre>
+          )}
+        </div>
       </div>
+
+      {/* Download button */}
       <a
-        href={`${API_BASE}/files/${names[active]}`}
-        download={names[active]}
+        href={`${API_BASE}/files/${activeName}`}
+        download={activeName}
         className={s.downloadBtn}
       >
         <Download size={12} />
-        Download {names[active]}
+        Download {activeName}
       </a>
     </div>
   );
