@@ -398,64 +398,6 @@ safe_name = Path(filename).name  # prevents ../../etc/passwd attacks
 
 ---
 
-## 🎯 Interview Q&A Prep
-
-### Architecture & Design
-
-**Q: Why LangGraph instead of a simple for-loop?**
-> LangGraph gives us a proper **stateful directed graph** with conditional routing — the retry logic (executor → debugger → executor) is expressed as a graph edge, not nested if-else. It also makes the pipeline visualizable, inspectable, and easier to extend (add a new node without refactoring existing ones).
-
-**Q: How does the retry mechanism work?**
-> Each step tracks `retry_count` in `AgentState`. After each executor failure, `route_after_executor()` checks: if `retry_count < MAX_RETRIES`, route to Debugger; else route to END with failed status. The Debugger increments the count, fixes the code, and sends it back to the Executor.
-
-**Q: Why is the Assembler separate from the Coder?**
-> Each Coder step is intentionally isolated — it solves one sub-problem and must end with `print()`. Merging them inline would require the LLM to hold the entire app in memory for every step, increasing hallucination risk. The Assembler runs once, after all steps succeed, with full context.
-
-**Q: How do you handle LLM non-determinism in code generation?**
-> Three layers: (1) Temperature = 0 for all agents. (2) Strict prompt rules (no fences, specific output format). (3) Post-generation regex stripping of any markdown code fences the model adds anyway.
-
-**Q: What's the security model for code execution?**
-> Each step runs in an isolated `subprocess` with a hard timeout (`EXEC_TIMEOUT=30s`). The subprocess has no network access beyond what Python stdlib allows. Path traversal is prevented on file downloads. In production, this would be upgraded to Docker/gVisor sandbox.
-
-### Technical Deep-Dives
-
-**Q: How does the test payload generator work without an LLM?**
-> It fetches `/openapi.json` from the running assembled app, resolves `$ref` schema references, iterates over field names, and looks them up in a 60+ entry dictionary (`_FIELD_VALUES`) of realistic values. Falls back to type-based defaults (int→42, bool→True), then to task-keyword heuristics, then to `{"input": "sample input"}`.
-
-**Q: Walk me through the data flow for "Build a sentiment API".**
-> 1. Planner → `["Define FastAPI skeleton", "Add Pydantic model", "Implement keyword sentiment"]`
-> 2. Coder → writes 15-line Python snippet for step 1, ending with `print("FastAPI skeleton complete")`
-> 3. Executor → `subprocess.run(python -c <code>)` → returns `STATUS: success`
-> 4. FileWriter → saves `step_1_define_fastapi_skeleton.py` → advances `current_step` to 1
-> 5. Repeat for steps 2 and 3
-> 6. Assembler → merges 3 files into `generated/app.py` → applies patches
-> 7. API Tester → starts uvicorn on :9000, polls /health, POSTs `{"text": "I love this!"}` → validates 200 OK
-
-**Q: How does the research pipeline differ architecturally?**
-> The research pipeline is a **sequential chain** (no graph), since there's no retry/branching logic. Each step feeds into the next: Tavily search → BeautifulSoup scrape → LLM writer → LLM critic. The coding pipeline uses LangGraph for its complex retry topology.
-
-**Q: What happens if the LLM forgets to include a /health endpoint?**
-> `_patch_app_code()` scans the assembled code for `/health` or `'/health'`. If absent, it injects a minimal `@app.get("/health")` before the first POST endpoint. This is a **deterministic fix** — no extra LLM call needed.
-
-### System Design
-
-**Q: How would you scale this to handle concurrent users?**
-> 1. Move `run_pipeline()` to a background task queue (Celery + Redis or FastAPI `BackgroundTasks`)
-> 2. Return a job ID immediately; clients poll `GET /jobs/{id}/status`
-> 3. Use per-request isolated `generated/` subdirectories to avoid file conflicts
-> 4. Run code execution in Docker containers for true isolation
-> 5. Add rate limiting per API key (Groq has rate limits too)
-
-**Q: How would you add memory/context across multiple pipeline runs?**
-> Store each run's `AgentState` in a database (PostgreSQL via SQLAlchemy). Add a `session_id` field. The Planner could retrieve past plans for similar tasks via vector similarity search (pgvector) to avoid re-planning from scratch.
-
-**Q: What monitoring would you add in production?**
-> - Prometheus metrics: pipeline duration, step failure rate, retry distribution per agent
-> - Distributed tracing (OpenTelemetry) through each agent node
-> - LLM call logging: token counts, latency, model version (for cost tracking)
-> - Alert on: pipeline failure rate > 5%, Groq API errors, execution timeout spikes
-
----
 
 ## 📊 Example Output
 
@@ -496,4 +438,4 @@ LOG_LEVEL=INFO
 
 ---
 
-*Built with LangChain · LangGraph · Groq · FastAPI · Streamlit*
+
