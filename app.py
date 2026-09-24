@@ -2,22 +2,30 @@
 app.py — FastAPI backend for the Autonomous AI Engineer.
 
 Endpoints:
-  POST /execute-task        → run the full pipeline for a coding task
-  GET  /health              → liveness probe
-  GET  /files/{filename}    → download a file from the generated/ directory
-  GET  /files               → list all files in the generated/ directory
+  POST /execute-task          → run the full pipeline (blocking, returns final JSON)
+  GET  /stream-task/{task_id} → SSE stream of live pipeline events
+  POST /submit-task           → enqueue a task, returns a task_id immediately
+  GET  /task/{task_id}        → poll status/result of a submitted task
+  GET  /health                → liveness probe
+  GET  /files/{filename}      → download a file from the generated/ directory
+  GET  /files                 → list all files in the generated/ directory
 
 Run with:
   uvicorn app:app --reload --port 8000
 """
 
+import asyncio
+import json
 import os
+import queue
+import threading
+import uuid
 from pathlib import Path
-from typing import Optional
+from typing import AsyncGenerator, Optional
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from config import GENERATED_DIR
@@ -36,15 +44,18 @@ app = FastAPI(
         "coding task and autonomously plans, generates, executes, debugs, and "
         "delivers working Python code."
     ),
-    version="1.0.0",
-    docs_url="/docs",      # Swagger UI at /docs
-    redoc_url="/redoc",    # ReDoc at /redoc
+    version="2.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
 )
 
-# Allow all origins for development — restrict in production
+# In production set ALLOWED_ORIGINS=https://your-app.vercel.app (comma-separated for multiple)
+_raw_origins = os.getenv("ALLOWED_ORIGINS", "*")
+_origins = [o.strip() for o in _raw_origins.split(",")] if _raw_origins != "*" else ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -52,12 +63,18 @@ app.add_middleware(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# IN-MEMORY TASK STORE  (good enough for a single-process deployment)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# task_id → { status, result, events: queue.Queue }
+_tasks: dict[str, dict] = {}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # SCHEMAS
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TaskRequest(BaseModel):
-    """Request body for POST /execute-task."""
-
     task: str = Field(
         ...,
         min_length=5,
@@ -67,25 +84,26 @@ class TaskRequest(BaseModel):
     )
     enable_critic: Optional[bool] = Field(
         default=False,
-        description="Set to true to enable the optional Critic agent for code quality review.",
+        description="Enable the optional Critic agent for code quality review.",
     )
 
 
 class TaskResponse(BaseModel):
-    """Response body returned by POST /execute-task."""
+    status: str
+    task: str
+    plan: list[str]
+    generated_files: list[str]
+    outputs: list[str]
+    errors: list[str]
+    logs: list[str]
 
-    status: str = Field(description="'success' or 'failed'")
-    task: str = Field(description="The original task string")
-    plan: list[str] = Field(description="Ordered list of steps produced by the Planner")
-    generated_files: list[str] = Field(description="Paths of files saved to disk")
-    outputs: list[str] = Field(description="Stdout captured from each execution")
-    errors: list[str] = Field(description="Stderr messages collected across all retries")
-    logs: list[str] = Field(description="Timestamped structured log of pipeline events")
+
+class SubmitResponse(BaseModel):
+    task_id: str
+    message: str
 
 
 class HealthResponse(BaseModel):
-    """Response body for GET /health."""
-
     status: str
     version: str
     generated_dir: str
@@ -93,49 +111,178 @@ class HealthResponse(BaseModel):
 
 
 class FileListResponse(BaseModel):
-    """Response body for GET /files."""
-
     files: list[str]
     count: int
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SSE HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _sse_event(data: dict) -> str:
+    """Format a dict as an SSE data line."""
+    return f"data: {json.dumps(data)}\n\n"
+
+
+async def _stream_task_events(task_id: str) -> AsyncGenerator[str, None]:
+    """
+    Async generator that yields SSE lines from a task's event queue.
+    Runs until the task produces a 'done' or 'error' event.
+    """
+    task = _tasks.get(task_id)
+    if task is None:
+        yield _sse_event({"type": "error", "message": "Task not found"})
+        return
+
+    event_queue: queue.Queue = task["events"]
+
+    while True:
+        try:
+            # Non-blocking get with a short sleep to stay async-friendly
+            event = event_queue.get_nowait()
+        except queue.Empty:
+            await asyncio.sleep(0.1)
+            continue
+
+        yield _sse_event(event)
+
+        if event.get("type") in ("done", "error"):
+            break
+
+
+def _run_pipeline_in_thread(task_id: str, task_text: str, enable_critic: bool):
+    """
+    Run the blocking pipeline in a background thread and push SSE events
+    into the task's queue as the pipeline progresses.
+    """
+    task = _tasks[task_id]
+    event_queue: queue.Queue = task["events"]
+
+    def push(event: dict):
+        event_queue.put(event)
+
+    try:
+        push({"type": "status", "stage": "planner", "message": "Planner agent starting…"})
+
+        if enable_critic:
+            os.environ["ENABLE_CRITIC"] = "true"
+
+        result = run_pipeline(task_text)
+
+        # Push log lines as individual events
+        for log_line in result.get("logs", []):
+            push({"type": "log", "message": log_line})
+
+        # Push plan
+        if result.get("plan"):
+            push({"type": "plan", "steps": result["plan"]})
+
+        # Push file list
+        if result.get("generated_files"):
+            push({"type": "files", "files": result["generated_files"]})
+
+        # Push final status
+        task["status"] = result["status"]
+        task["result"] = result
+        push({
+            "type": "done",
+            "status": result["status"],
+            "task": result["task"],
+            "plan": result.get("plan", []),
+            "generated_files": result.get("generated_files", []),
+            "outputs": result.get("outputs", []),
+            "errors": result.get("errors", []),
+            "logs": result.get("logs", []),
+        })
+
+    except Exception as exc:
+        task["status"] = "failed"
+        push({
+            "type": "error",
+            "message": f"Pipeline crashed: {exc}",
+        })
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ENDPOINTS
 # ─────────────────────────────────────────────────────────────────────────────
 
+@app.post("/submit-task", response_model=SubmitResponse, tags=["Pipeline"])
+async def submit_task(request: TaskRequest) -> SubmitResponse:
+    """
+    Enqueue a pipeline task and return a task_id immediately.
+    Poll GET /task/{task_id} or stream GET /stream-task/{task_id} for results.
+    """
+    task_id = str(uuid.uuid4())
+    _tasks[task_id] = {
+        "status": "running",
+        "result": None,
+        "events": queue.Queue(),
+    }
+
+    thread = threading.Thread(
+        target=_run_pipeline_in_thread,
+        args=(task_id, request.task, request.enable_critic or False),
+        daemon=True,
+    )
+    thread.start()
+
+    log_step("api", f"Task {task_id} submitted: {request.task[:60]}")
+    return SubmitResponse(task_id=task_id, message="Task queued and running.")
+
+
+@app.get("/stream-task/{task_id}", tags=["Pipeline"])
+async def stream_task(task_id: str):
+    """
+    Server-Sent Events stream for a running task.
+    Connect immediately after POST /submit-task and receive live progress events.
+    """
+    if task_id not in _tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    return StreamingResponse(
+        _stream_task_events(task_id),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/task/{task_id}", tags=["Pipeline"])
+async def get_task(task_id: str):
+    """Poll the status and result of a submitted task."""
+    task = _tasks.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    return {
+        "task_id": task_id,
+        "status": task["status"],
+        "result": task["result"],
+    }
+
+
 @app.post(
     "/execute-task",
     response_model=TaskResponse,
-    summary="Run the autonomous coding pipeline",
+    summary="Run the autonomous coding pipeline (blocking)",
     tags=["Pipeline"],
 )
 async def execute_task(request: TaskRequest) -> TaskResponse:
     """
-    Accept a natural language coding task and run the full multi-agent pipeline:
-
-    1. **Planner** — breaks the task into ordered steps
-    2. **Coder** — writes Python code for each step
-    3. **Executor** — runs each code snippet in a sandboxed subprocess
-    4. **Debugger** — fixes errors and retries (up to MAX_RETRIES times)
-    5. **File Writer** — saves successful code to `generated/`
-    6. **Critic** *(optional)* — reviews final code for quality
-
-    Returns generated files, execution logs, and a final status.
+    Blocking endpoint — runs the full pipeline and returns final JSON.
+    For real-time progress, use POST /submit-task + GET /stream-task/{id}.
     """
     log_step("api", f"Received task: {request.task[:80]}")
-
-    # Temporarily override ENABLE_CRITIC if the request overrides it
     if request.enable_critic is not None:
         os.environ["ENABLE_CRITIC"] = str(request.enable_critic).lower()
 
     try:
         result = run_pipeline(request.task)
     except Exception as exc:
-        # Catch unexpected errors and return a 500 with detail
-        raise HTTPException(
-            status_code=500,
-            detail=f"Pipeline crashed unexpectedly: {str(exc)}",
-        )
+        raise HTTPException(status_code=500, detail=f"Pipeline crashed: {str(exc)}")
 
     return TaskResponse(
         status=result["status"],
@@ -148,91 +295,41 @@ async def execute_task(request: TaskRequest) -> TaskResponse:
     )
 
 
-@app.get(
-    "/health",
-    response_model=HealthResponse,
-    summary="Liveness / health check",
-    tags=["System"],
-)
+@app.get("/health", response_model=HealthResponse, tags=["System"])
 async def health_check() -> HealthResponse:
-    """
-    Returns 200 with system info if the service is up and the generated/
-    directory is accessible. Safe to use as a Kubernetes/Docker liveness probe.
-    """
     files_on_disk = len(list(GENERATED_DIR.glob("*.py")))
-
     return HealthResponse(
         status="ok",
-        version="1.0.0",
+        version="2.0.0",
         generated_dir=str(GENERATED_DIR.resolve()),
         files_on_disk=files_on_disk,
     )
 
 
-@app.get(
-    "/files",
-    response_model=FileListResponse,
-    summary="List all generated files",
-    tags=["Files"],
-)
+@app.get("/files", response_model=FileListResponse, tags=["Files"])
 async def list_files() -> FileListResponse:
-    """
-    Returns a list of all Python files currently stored in the `generated/`
-    directory (filenames only, not full paths).
-    """
     files = sorted(p.name for p in GENERATED_DIR.glob("*.py"))
     return FileListResponse(files=files, count=len(files))
 
 
-@app.get(
-    "/files/{filename}",
-    summary="Download a generated file",
-    tags=["Files"],
-)
+@app.get("/files/{filename}", tags=["Files"])
 async def download_file(filename: str) -> FileResponse:
-    """
-    Download a specific generated file by name.
-
-    Args:
-        filename: The filename (e.g., `step_1_sentiment_api.py`)
-
-    Returns:
-        The raw file as a downloadable attachment.
-
-    Raises:
-        404 if the file does not exist.
-    """
-    # Security: prevent path traversal attacks
-    safe_name = Path(filename).name   # strips any directory components
+    safe_name = Path(filename).name
     target = GENERATED_DIR / safe_name
-
     if not target.exists():
-        raise HTTPException(
-            status_code=404,
-            detail=f"File '{safe_name}' not found in generated/",
-        )
-
-    return FileResponse(
-        path=str(target),
-        filename=safe_name,
-        media_type="text/plain",
-    )
+        raise HTTPException(status_code=404, detail=f"File '{safe_name}' not found")
+    return FileResponse(path=str(target), filename=safe_name, media_type="text/plain")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STARTUP / SHUTDOWN EVENTS
+# STARTUP
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.on_event("startup")
 async def on_startup() -> None:
-    """Ensure the generated/ directory exists on server start."""
     GENERATED_DIR.mkdir(exist_ok=True)
-    log_step("api", f"Server started. Generated dir: {GENERATED_DIR.resolve()}")
+    log_step("api", f"Server v2 started. Generated dir: {GENERATED_DIR.resolve()}")
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# DEV SERVER (direct run: python app.py)
-# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
